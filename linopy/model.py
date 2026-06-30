@@ -31,11 +31,11 @@ from linopy.alignment import as_dataarray, broadcast_to_coords
 from linopy.common import (
     assign_multiindex_safe,
     best_int,
+    fitting_label_dtype,
     maybe_replace_signs,
     replace_by_map,
     to_path,
 )
-from linopy.config import options
 from linopy.constants import (
     GREATER_EQUAL,
     HELPER_DIMS,
@@ -825,14 +825,8 @@ class Model:
 
         start = self._xCounter
         end = start + data.labels.size
-        label_dtype = options["label_dtype"]
-        if end > np.iinfo(label_dtype).max:
-            raise ValueError(
-                f"Number of labels ({end}) exceeds the maximum value for "
-                f"{label_dtype.__name__} ({np.iinfo(label_dtype).max})."
-            )
         data.labels.values = np.arange(
-            start, end, dtype=options["label_dtype"]
+            start, end, dtype=fitting_label_dtype(end)
         ).reshape(data.labels.shape)
         self._xCounter += data.labels.size
 
@@ -978,15 +972,9 @@ class Model:
         """Assign label ranges from the constraint counter and apply an optional mask."""
         start = self._cCounter
         end = start + data.labels.size
-        label_dtype = options["label_dtype"]
-        if end > np.iinfo(label_dtype).max:
-            raise ValueError(
-                f"Number of labels ({end}) exceeds the maximum value for "
-                f"{label_dtype.__name__} ({np.iinfo(label_dtype).max})."
-            )
-        data.labels.values = np.arange(start, end, dtype=label_dtype).reshape(
-            data.labels.shape
-        )
+        data.labels.values = np.arange(
+            start, end, dtype=fitting_label_dtype(end)
+        ).reshape(data.labels.shape)
         self._cCounter += data.labels.size
         if mask is not None:
             data.labels.values = np.where(mask.values, data.labels.values, -1)

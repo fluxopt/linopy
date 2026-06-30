@@ -49,6 +49,7 @@ from linopy.common import (
     EmptyDeprecationWrapper,
     LocIndexer,
     assign_multiindex_safe,
+    astype_labels,
     check_common_keys_values,
     check_has_nulls,
     check_has_nulls_polars,
@@ -451,9 +452,7 @@ class BaseExpression(ABC):
             )
 
         if np.issubdtype(data.vars, np.floating):
-            data = assign_multiindex_safe(
-                data, vars=data.vars.fillna(-1).astype(options["label_dtype"])
-            )
+            data = assign_multiindex_safe(data, vars=astype_labels(data.vars))
         if not np.issubdtype(data.coeffs, np.floating):
             data["coeffs"].values = data.coeffs.values.astype(float)
 
@@ -1537,7 +1536,7 @@ class BaseExpression(ABC):
         linopy.LinearExpression
         """
         if not np.issubdtype(self.vars.dtype, np.integer):
-            return self.assign(vars=self.vars.fillna(-1).astype(options["label_dtype"]))
+            return self.assign(vars=astype_labels(self.vars))
 
         return self
 
@@ -1941,12 +1940,12 @@ class LinearExpression(BaseExpression):
         # Combined has dimensions (.., CV_DIM, TERM_DIM)
 
         # Drop terms where all vars are -1 (i.e., empty terms across all coordinates)
-        vars = combined.isel({CV_DIM: 0}).astype(options["label_dtype"])
+        vars = astype_labels(combined.isel({CV_DIM: 0}))
         non_empty_terms = (vars != -1).any(dim=[d for d in vars.dims if d != TERM_DIM])
         combined = combined.isel({TERM_DIM: non_empty_terms})
 
         # Extract vars and coeffs from the combined result
-        vars = combined.isel({CV_DIM: 0}).astype(options["label_dtype"])
+        vars = astype_labels(combined.isel({CV_DIM: 0}))
         coeffs = combined.isel({CV_DIM: 1})
 
         # Create new dataset with simplified data

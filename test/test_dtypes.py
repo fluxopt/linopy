@@ -45,19 +45,46 @@ def test_solve_with_int32_labels() -> None:
     assert m.objective.value == pytest.approx(25.0)
 
 
-def test_overflow_guard_variables() -> None:
+def test_variable_labels_widen_past_int32() -> None:
     m = Model()
     m._xCounter = np.iinfo(np.int32).max - 1
-    with pytest.raises(ValueError, match="exceeds the maximum"):
-        m.add_variables(lower=0, upper=1, coords=[range(5)], name="x")
+    x = m.add_variables(lower=0, upper=1, coords=[range(5)], name="x")
+    assert x.labels.dtype == np.int64
+    assert int(x.labels.max()) > np.iinfo(np.int32).max
 
 
-def test_overflow_guard_constraints() -> None:
+def test_constraint_labels_widen_past_int32() -> None:
     m = Model()
     x = m.add_variables(lower=0, upper=1, coords=[range(5)], name="x")
     m._cCounter = np.iinfo(np.int32).max - 1
-    with pytest.raises(ValueError, match="exceeds the maximum"):
-        m.add_constraints(x >= 0, name="c")
+    m.add_constraints(x >= 0, name="c")
+    assert m.constraints["c"].labels.dtype == np.int64
+    assert int(m.constraints["c"].labels.max()) > np.iinfo(np.int32).max
+
+
+def test_fitting_label_dtype_floors_and_widens() -> None:
+    from linopy.common import fitting_label_dtype
+
+    # below the int32 ceiling: floored at the configured default
+    assert fitting_label_dtype(100) == np.int32
+    assert fitting_label_dtype(np.iinfo(np.int32).max) == np.int32
+    # above it: widened, never truncated
+    assert fitting_label_dtype(np.iinfo(np.int32).max + 1) == np.int64
+
+
+def test_astype_labels_preserves_values_past_int32() -> None:
+    # The label cast-back paths (ffill / sanitize / save_join / ...) must not
+    # truncate labels beyond the int32 ceiling back to the int32 default.
+    from xarray import DataArray
+
+    from linopy.common import astype_labels
+
+    big = np.iinfo(np.int32).max + 10
+    # simulate the float round-trip these paths see (NaN -> -1 fill)
+    da = DataArray(np.array([big, big + 1, np.nan], dtype=float))
+    out = astype_labels(da)
+    assert out.dtype == np.int64
+    np.testing.assert_array_equal(out.values, [big, big + 1, -1])
 
 
 def test_label_dtype_option_int64() -> None:

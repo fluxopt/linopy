@@ -305,7 +305,7 @@ def save_join(*dataarrays: DataArray, integer_dtype: bool = False) -> Dataset:
         )
         arrs = xr_align(*dataarrays, join="outer")
         if integer_dtype:
-            arrs = tuple([ds.fillna(-1).astype(options["label_dtype"]) for ds in arrs])
+            arrs = tuple([astype_labels(ds) for ds in arrs])
     return Dataset({ds.name: ds for ds in arrs})
 
 
@@ -482,6 +482,30 @@ def best_int(max_value: int) -> type[signedinteger[Any]]:
         if max_value <= np.iinfo(t).max:
             return t
     raise ValueError(f"Value {max_value} is too large for int64.")
+
+
+def fitting_label_dtype(max_value: int) -> type[signedinteger[Any]]:
+    """
+    Narrowest label dtype that holds ``max_value``, but never narrower than
+    ``options["label_dtype"]``.
+
+    The configured ``label_dtype`` acts as a floor: models that fit it keep a
+    single, predictable dtype, while models exceeding it are widened (e.g. to
+    ``int64``) instead of overflowing.
+    """
+    floor = options["label_dtype"]
+    fit = best_int(max_value) if max_value >= 0 else floor
+    return max(floor, fit, key=lambda t: np.dtype(t).itemsize)
+
+
+def astype_labels(da: DataArray, fill_value: int = -1) -> DataArray:
+    """
+    Fill missing entries and cast a labels array to the narrowest int dtype that
+    holds its values without truncation (see :func:`fitting_label_dtype`).
+    """
+    filled = da.fillna(fill_value)
+    max_value = int(filled.max()) if filled.size else 0
+    return filled.astype(fitting_label_dtype(max_value))
 
 
 def get_index_map(*arrays: Sequence[Hashable]) -> dict[tuple, int]:

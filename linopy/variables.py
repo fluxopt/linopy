@@ -37,6 +37,7 @@ from linopy.common import (
     LocIndexer,
     VariableLabelIndex,
     assign_multiindex_safe,
+    astype_labels,
     check_has_nulls,
     check_has_nulls_polars,
     filter_nulls_polars,
@@ -1265,6 +1266,7 @@ class Variable:
         -------
         linopy.Variable
         """
+        label_dtype = self.labels.dtype
         data = (
             self.data.where(self.labels != -1)
             # .ffill(dim, limit=limit)
@@ -1272,9 +1274,7 @@ class Variable:
             .map(DataArray.ffill, dim=dim, limit=limit)
             .fillna(self._fill_value)
         )
-        return self.assign_multiindex_safe(
-            labels=data.labels.astype(options["label_dtype"])
-        )
+        return self.assign_multiindex_safe(labels=data.labels.astype(label_dtype))
 
     def bfill(self, dim: str, limit: None = None) -> Variable:
         """
@@ -1294,6 +1294,7 @@ class Variable:
         -------
         linopy.Variable
         """
+        label_dtype = self.labels.dtype
         data = (
             self.data.where(~self.isnull())
             # .bfill(dim, limit=limit)
@@ -1301,7 +1302,7 @@ class Variable:
             .map(DataArray.bfill, dim=dim, limit=limit)
             .fillna(self._fill_value)
         )
-        return self.assign(labels=data.labels.astype(options["label_dtype"]))
+        return self.assign(labels=data.labels.astype(label_dtype))
 
     def sanitize(self) -> Variable:
         """
@@ -1312,9 +1313,7 @@ class Variable:
         linopy.Variable
         """
         if issubdtype(self.labels.dtype, floating):
-            return self.assign(
-                labels=self.labels.fillna(-1).astype(options["label_dtype"])
-            )
+            return self.assign(labels=astype_labels(self.labels))
         return self
 
     def equals(self, other: Variable) -> bool:
