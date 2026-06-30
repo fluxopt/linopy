@@ -107,6 +107,48 @@ def test_variables_nvars(m: Model) -> None:
     assert m.variables.nvars == 19
 
 
+def test_variables_mask_broadcast() -> None:
+    m = Model()
+
+    lower = xr.DataArray(np.zeros((10, 10)), coords=[range(10), range(10)])
+    upper = xr.DataArray(np.ones((10, 10)), coords=[range(10), range(10)])
+
+    mask = pd.Series([True] * 5 + [False] * 5)
+    x = m.add_variables(lower, upper, name="x", mask=mask)
+    assert (x.labels[0:5, :] != -1).all()
+    assert (x.labels[5:10, :] == -1).all()
+
+    mask2 = xr.DataArray([True] * 5 + [False] * 5, dims=["dim_1"])
+    y = m.add_variables(lower, upper, name="y", mask=mask2)
+    assert (y.labels[:, 0:5] != -1).all()
+    assert (y.labels[:, 5:10] == -1).all()
+
+    # Pandas Series with named index missing a dim is broadcast to data.coords.
+    mask_pd = pd.Series(
+        [True, False, True] + [False] * 7, index=pd.RangeIndex(10, name="dim_0")
+    )
+    v = m.add_variables(lower, upper, name="v", mask=mask_pd)
+    assert (v.labels[[0, 2], :] != -1).all()
+    assert (v.labels[[1, 3, 4, 5, 6, 7, 8, 9], :] == -1).all()
+
+    # Mask with sparse coords (subset of data's coords) now raises instead of
+    # emitting a FutureWarning — the rule from the bounds path applies here too.
+    mask3 = xr.DataArray(
+        [True, True, False, False, False],
+        dims=["dim_0"],
+        coords={"dim_0": range(5)},
+    )
+    with pytest.raises(
+        ValueError, match=r"mask: coordinate values for dimension 'dim_0'"
+    ):
+        m.add_variables(lower, upper, name="z", mask=mask3)
+
+    # Mask with extra dimension not in data should raise
+    mask4 = xr.DataArray([True, False], dims=["extra_dim"])
+    with pytest.raises(ValueError, match=r"mask has dimension\(s\) \['extra_dim'\]"):
+        m.add_variables(lower, upper, name="w", mask=mask4)
+
+
 def test_variables_get_name_by_label(m: Model) -> None:
     assert m.variables.get_name_by_label(4) == "x"
     assert m.variables.get_name_by_label(12) == "y"

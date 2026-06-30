@@ -21,11 +21,16 @@ from linopy import GREATER_EQUAL, LESS_EQUAL, Model, solvers
 from linopy.common import to_path
 from linopy.expressions import LinearExpression
 from linopy.solver_capabilities import (
-    SolverFeature,
     get_available_solvers_with_feature,
     solver_supports,
 )
-from linopy.solvers import _new_highspy_mps_layout, available_solvers, quadratic_solvers
+from linopy.solvers import (
+    SolverFeature,
+    _new_highspy_mps_layout,
+    _solver_class_for,
+    licensed_solvers,
+    quadratic_solvers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,38 +38,42 @@ io_apis: list[str] = ["lp", "lp-polars"]
 
 explicit_coordinate_names = [False, True]
 
-if "highs" in available_solvers:
+if "highs" in licensed_solvers:
     # mps io is only supported via highspy
     io_apis.append("mps")
 
 file_io_solvers = get_available_solvers_with_feature(
-    SolverFeature.READ_MODEL_FROM_FILE, available_solvers
+    SolverFeature.READ_MODEL_FROM_FILE, licensed_solvers
 )
 params: list[tuple[str, str, bool]] = list(
     itertools.product(file_io_solvers, io_apis, explicit_coordinate_names)
 )
 
 direct_solvers = get_available_solvers_with_feature(
-    SolverFeature.DIRECT_API, available_solvers
+    SolverFeature.DIRECT_API, licensed_solvers
 )
 for solver in direct_solvers:
     params.append((solver, "direct", False))
 
-if "mosek" in available_solvers:
+set_names_direct_solvers = [
+    solver for solver in ("highs", "gurobi") if solver in direct_solvers
+]
+
+if "mosek" in licensed_solvers:
     params.append(("mosek", "lp", False))
     params.append(("mosek", "lp", True))
 
 
-# Note: Platform-specific solver bugs (e.g., SCIP quadratic on Windows) are now
+# Note: Platform-specific solver bugs are now
 # handled in linopy/solver_capabilities.py by adjusting the registry at import time.
 feasible_quadratic_solvers: list[str] = list(quadratic_solvers)
 
 feasible_mip_solvers: list[str] = get_available_solvers_with_feature(
-    SolverFeature.INTEGER_VARIABLES, available_solvers
+    SolverFeature.INTEGER_VARIABLES, licensed_solvers
 )
 
 gpu_solvers: list[str] = get_available_solvers_with_feature(
-    SolverFeature.GPU_ACCELERATION, available_solvers
+    SolverFeature.GPU_ONLY, licensed_solvers
 )
 
 # set tolerances for solution checking based on solver type (CPU vs. GPU)
@@ -75,7 +84,7 @@ GPU_SOL_TOL: float = 2.5e-4  # gpu solvers typically have lower numerical precis
 def test_print_solvers(capsys: Any) -> None:
     with capsys.disabled():
         print(
-            f"\ntesting solvers: {', '.join(available_solvers)}\n"
+            f"\ntesting solvers: {', '.join(licensed_solvers)}\n"
             f"testing quadratic solvers: {', '.join(feasible_quadratic_solvers)}"
         )
 
@@ -298,7 +307,7 @@ def modified_model() -> Model:
     x = m.add_variables(coords=[lower.index], name="x", binary=True)
     y = m.add_variables(lower, name="y")
 
-    c = m.add_constraints(x + y, GREATER_EQUAL, 10)
+    c = m.add_constraints(x + y, GREATER_EQUAL, 10, freeze=False)
 
     y.lower = 9
     c.lhs = 2 * x + y
@@ -464,7 +473,7 @@ def test_model_maximization(
     assert m.objective.sense == "max"
     assert m.objective.value is None
 
-    if solver in ["cbc", "glpk"] and io_api == "mps" and _new_highspy_mps_layout:
+    if solver in ["cbc", "glpk"] and io_api == "mps" and _new_highspy_mps_layout():
         with pytest.raises(ValueError):
             m.solve(
                 solver,
@@ -490,6 +499,22 @@ def test_mock_solve(model_maximization: Model) -> None:
     x_solution = m.variables["x"].solution
     assert x_solution.coords == m.variables["x"].coords
     assert (x_solution == 0).all()
+
+
+@pytest.mark.skipif("highs" not in licensed_solvers, reason="HiGHS is not installed")
+def test_mock_solve_clears_existing_solver_state(model: Model) -> None:
+    status, condition = model.solve(solver_name="highs", io_api="direct")
+    assert status == "ok"
+    assert model.solver is not None
+    assert model.solver_model is not None
+    assert model.solver_name == "highs"
+
+    status, condition = model.solve(solver="some_non_existant_solver", mock_solve=True)
+
+    assert status == "ok"
+    assert model.solver is None
+    assert model.solver_model is None
+    assert model.solver_name is None
 
 
 @pytest.mark.parametrize("solver,io_api,explicit_coordinate_names", params)
@@ -530,7 +555,7 @@ def test_solver_time_limit_options(
         "cplex": {"timelimit": 1},
         "xpress": {"maxtime": 1},
         "highs": {"time_limit": 1},
-        "scip": {"limits/time": 1},
+        "scip": {"limits/time": 10},  # increase time limit to avoid race condition
         "mosek": {"MSK_DPAR_OPTIMIZER_MAX_TIME": 1},
         "mindopt": {"MaxTime": 1},
         "copt": {"TimeLimit": 1},
@@ -672,7 +697,9 @@ def test_infeasible_model(
         with pytest.warns(DeprecationWarning):
             model.compute_set_of_infeasible_constraints()
         model.compute_infeasibilities()
-        model.print_infeasibilities()
+        formatted = model.format_infeasibilities()
+        assert isinstance(formatted, str)
+        assert formatted
     else:
         with pytest.raises((NotImplementedError, ImportError)):
             model.compute_infeasibilities()
@@ -708,6 +735,50 @@ def test_milp_binary_model(
     assert (
         (milp_binary_model.solution.y == 1) | (milp_binary_model.solution.y == 0)
     ).all()
+
+
+FIXED_VAR_CASES = [
+    pytest.param("continuous", {}, 7.0, 100, id="continuous-lower-raised"),
+    pytest.param("continuous", {}, 3.0, -100, id="continuous-upper-lowered"),
+    pytest.param("integer", {"integer": True}, 7.0, 100, id="integer-lower-raised"),
+    pytest.param("integer", {"integer": True}, 3.0, -100, id="integer-upper-lowered"),
+    pytest.param("binary", {"binary": True}, 1.0, 100, id="binary-1"),
+    pytest.param("binary", {"binary": True}, 0.0, -100, id="binary-0"),
+]
+
+
+@pytest.mark.parametrize("kind,var_kwargs,fixval,coef", FIXED_VAR_CASES)
+@pytest.mark.parametrize(
+    "solver,io_api,explicit_coordinate_names",
+    [p for p in params if p[0] not in ["mindopt"]],
+)
+def test_fixed_variable_is_held(
+    solver: str,
+    io_api: str,
+    explicit_coordinate_names: bool,
+    kind: str,
+    var_kwargs: dict,
+    fixval: float,
+    coef: float,
+) -> None:
+    if kind in ("integer", "binary") and solver not in feasible_mip_solvers:
+        pytest.skip(f"{solver} does not support MIP")
+
+    m = Model()
+    if "binary" in var_kwargs:
+        v = m.add_variables(name="v", **var_kwargs)
+    else:
+        v = m.add_variables(lower=0, upper=10, name="v", **var_kwargs)
+    x = m.add_variables(lower=0, upper=10, name="x")
+    m.add_constraints(x >= 2, name="c")
+    m.add_objective(x + coef * v)
+    v.fix(fixval)
+
+    status, condition = m.solve(
+        solver, io_api=io_api, explicit_coordinate_names=explicit_coordinate_names
+    )
+    assert condition == "optimal"
+    assert float(m.solution.v) == pytest.approx(fixval)
 
 
 @pytest.mark.parametrize(
@@ -747,6 +818,15 @@ def test_milp_model(
     )
     assert condition == "optimal"
     assert ((milp_model.solution.y == 9) | (milp_model.solution.x == 0.5)).all()
+
+    solver_cls = _solver_class_for(solver)
+    if solver_cls is not None and solver_cls.supports(
+        SolverFeature.MIP_DUAL_BOUND_REPORT
+    ):
+        assert milp_model.solver is not None
+        report = milp_model.solver.report
+        assert report is not None
+        assert report.dual_bound is not None
 
 
 @pytest.mark.parametrize(
@@ -986,7 +1066,7 @@ def test_solution_fn_parent_dir_doesnt_exist(
         assert status == "ok"
 
 
-@pytest.mark.parametrize("solver", available_solvers)
+@pytest.mark.parametrize("solver", licensed_solvers)
 def test_non_supported_solver_io(model: Model, solver: str) -> None:
     with pytest.raises(ValueError):
         model.solve(solver, io_api="non_supported")
@@ -1004,6 +1084,60 @@ def test_solver_attribute_getter(
         rc = model.variables.get_solver_attribute("RC")
         assert isinstance(rc, xr.Dataset)
         assert set(rc) == set(model.variables)
+
+
+def assert_semantically_equal_direct_solves(
+    solved_with_names: Model, solved_without_names: Model, solver: str
+) -> None:
+    tol = GPU_SOL_TOL if solver in gpu_solvers else CPU_SOL_TOL
+
+    assert solved_with_names.status == solved_without_names.status
+    assert (
+        solved_with_names.termination_condition
+        == solved_without_names.termination_condition
+    )
+    assert solved_with_names.objective.value is not None
+    assert solved_without_names.objective.value is not None
+    assert solved_with_names.objective.value == pytest.approx(
+        solved_without_names.objective.value, rel=tol
+    )
+    assert_allclose(
+        solved_with_names.solution,
+        solved_without_names.solution,
+        rtol=tol,
+        atol=tol,
+    )
+
+    dual_with_names = solved_with_names.dual
+    dual_without_names = solved_without_names.dual
+    assert set(dual_with_names.data_vars) == set(dual_without_names.data_vars)
+    if dual_with_names.data_vars:
+        assert_allclose(
+            dual_with_names,
+            dual_without_names,
+            rtol=tol,
+            atol=tol,
+        )
+
+
+@pytest.mark.parametrize("solver", set_names_direct_solvers)
+def test_direct_solve_set_names_semantic_equivalence(model: Model, solver: str) -> None:
+    model_with_names = model.copy(deep=True)
+    model_without_names = model.copy(deep=True)
+
+    status_with_names, condition_with_names = model_with_names.solve(
+        solver_name=solver, io_api="direct", set_names=True
+    )
+    status_without_names, condition_without_names = model_without_names.solve(
+        solver_name=solver, io_api="direct", set_names=False
+    )
+
+    assert status_with_names == "ok"
+    assert status_without_names == "ok"
+    assert condition_with_names == condition_without_names
+    assert_semantically_equal_direct_solves(
+        model_with_names, model_without_names, solver
+    )
 
 
 @pytest.mark.parametrize("solver,io_api,explicit_coordinate_names", params)
@@ -1038,7 +1172,7 @@ def test_solver_classes_from_problem_file(
 ) -> None:
     # first test initialization of super class. Should not be possible to initialize
     with pytest.raises(TypeError):
-        solvers.Solver()  # type: ignore
+        solvers.Solver()
 
     # initialize the solver as object of solver subclass <solver_class>
     solver_class = getattr(solvers, f"{solvers.SolverName(solver).name}")
@@ -1089,6 +1223,70 @@ def test_solver_classes_direct(
     elif not solver_supports(solver, SolverFeature.DIRECT_API):
         with pytest.raises(NotImplementedError):
             solver_.solve_problem(model=model)
+
+
+@pytest.fixture
+def auto_mask_variable_model() -> Model:
+    """Model with auto_mask=True and NaN in variable bounds."""
+    m = Model(auto_mask=True)
+
+    x = m.add_variables(lower=0, coords=[range(10)], name="x")
+    lower = pd.Series([0.0] * 8 + [np.nan, np.nan], range(10))
+    y = m.add_variables(lower=lower, name="y")  # NaN bounds auto-masked
+
+    m.add_constraints(x + y, GREATER_EQUAL, 10)
+    m.add_constraints(y, GREATER_EQUAL, 0)
+    m.add_objective(2 * x + y)
+    return m
+
+
+@pytest.fixture
+def auto_mask_constraint_model() -> Model:
+    """Model with auto_mask=True and NaN in constraint RHS."""
+    m = Model(auto_mask=True)
+
+    x = m.add_variables(lower=0, coords=[range(10)], name="x")
+    y = m.add_variables(lower=0, coords=[range(10)], name="y")
+
+    rhs = pd.Series([10.0] * 8 + [np.nan, np.nan], range(10))
+    m.add_constraints(x + y, GREATER_EQUAL, rhs)  # NaN rhs auto-masked
+    m.add_constraints(x + y, GREATER_EQUAL, 5)
+
+    m.add_objective(2 * x + y)
+    return m
+
+
+@pytest.mark.parametrize("solver,io_api,explicit_coordinate_names", params)
+def test_auto_mask_variable_model(
+    auto_mask_variable_model: Model,
+    solver: str,
+    io_api: str,
+    explicit_coordinate_names: bool,
+) -> None:
+    """Test that auto_mask=True correctly masks variables with NaN bounds."""
+    auto_mask_variable_model.solve(
+        solver, io_api=io_api, explicit_coordinate_names=explicit_coordinate_names
+    )
+    y = auto_mask_variable_model.variables.y
+    # Same assertions as test_masked_variable_model
+    assert y.solution[-2:].isnull().all()
+    assert y.solution[:-2].notnull().all()
+
+
+@pytest.mark.parametrize("solver,io_api,explicit_coordinate_names", params)
+def test_auto_mask_constraint_model(
+    auto_mask_constraint_model: Model,
+    solver: str,
+    io_api: str,
+    explicit_coordinate_names: bool,
+) -> None:
+    """Test that auto_mask=True correctly masks constraints with NaN RHS."""
+    auto_mask_constraint_model.solve(
+        solver, io_api=io_api, explicit_coordinate_names=explicit_coordinate_names
+    )
+    # Same assertions as test_masked_constraint_model
+    assert (auto_mask_constraint_model.solution.y[:-2] == 10).all()
+    assert (auto_mask_constraint_model.solution.y[-2:] == 5).all()
 
 
 # def init_model_large():

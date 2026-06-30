@@ -7,58 +7,29 @@ Created on Wed Mar 17 17:06:36 2021.
 
 from __future__ import annotations
 
+import warnings
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import polars as pl
 import pytest
 import xarray as xr
+from xarray.core.types import JoinOptions
 from xarray.testing import assert_equal
 
-from linopy import LinearExpression, Model, QuadraticExpression, Variable, merge
+from linopy import (
+    EvolvingAPIWarning,
+    LinearExpression,
+    Model,
+    QuadraticExpression,
+    Variable,
+    merge,
+)
 from linopy.constants import HELPER_DIMS, TERM_DIM
 from linopy.expressions import ScalarLinearExpression
 from linopy.testing import assert_linequal, assert_quadequal
 from linopy.variables import ScalarVariable
-
-
-@pytest.fixture
-def m() -> Model:
-    m = Model()
-
-    m.add_variables(pd.Series([0, 0]), 1, name="x")
-    m.add_variables(4, pd.Series([8, 10]), name="y")
-    m.add_variables(0, pd.DataFrame([[1, 2], [3, 4], [5, 6]]).T, name="z")
-    m.add_variables(coords=[pd.RangeIndex(20, name="dim_2")], name="v")
-
-    idx = pd.MultiIndex.from_product([[1, 2], ["a", "b"]], names=("level1", "level2"))
-    idx.name = "dim_3"
-    m.add_variables(coords=[idx], name="u")
-    return m
-
-
-@pytest.fixture
-def x(m: Model) -> Variable:
-    return m.variables["x"]
-
-
-@pytest.fixture
-def y(m: Model) -> Variable:
-    return m.variables["y"]
-
-
-@pytest.fixture
-def z(m: Model) -> Variable:
-    return m.variables["z"]
-
-
-@pytest.fixture
-def v(m: Model) -> Variable:
-    return m.variables["v"]
-
-
-@pytest.fixture
-def u(m: Model) -> Variable:
-    return m.variables["u"]
 
 
 def test_empty_linexpr(m: Model) -> None:
@@ -92,7 +63,7 @@ def test_linexpr_with_helper_dims_as_coords(m: Model) -> None:
     assert set(HELPER_DIMS).intersection(set(data.coords))
 
     expr = LinearExpression(data, m)
-    assert not set(HELPER_DIMS).intersection(set(expr.data.coords))
+    assert not set(HELPER_DIMS).intersection(set(expr.coords))
 
 
 def test_linexpr_with_data_without_coords(m: Model) -> None:
@@ -325,6 +296,27 @@ def test_linear_expression_multi_indexed(u: Variable) -> None:
     assert isinstance(expr, LinearExpression)
 
 
+def test_multiply_expression_by_multiindex_level_constant(u: Variable) -> None:
+    """
+    Expression over a MultiIndex dim times a single-level constant.
+
+    Mirrors PyPSA's ``soc_delta * storage_weightings``: ``u`` is indexed by
+    the (level1, level2) MultiIndex ``dim_3``; the weighting is indexed only
+    by ``level1``. The product must not raise, and each ``dim_3`` entry must
+    take the weight of its ``level1``.
+    """
+    by_level1 = xr.DataArray([10.0, 20.0], coords={"level1": [1, 2]}, dims=["level1"])
+
+    with pytest.warns(EvolvingAPIWarning, match=r"broadcasting level subset"):
+        expr = (1 * u) * by_level1
+
+    coeffs = expr.coeffs.squeeze("_term")
+    assert coeffs.sel(dim_3=(1, "a")).item() == 10.0
+    assert coeffs.sel(dim_3=(1, "b")).item() == 10.0
+    assert coeffs.sel(dim_3=(2, "a")).item() == 20.0
+    assert coeffs.sel(dim_3=(2, "b")).item() == 20.0
+
+
 def test_linear_expression_with_errors(m: Model, x: Variable) -> None:
     with pytest.raises(TypeError):
         x / x
@@ -555,6 +547,47 @@ def test_matmul_expr_and_const(x: Variable, y: Variable) -> None:
     assert_linequal(expr.dot(const), target)
 
 
+def test_matmul_contracts_only_shared_dims(z: Variable) -> None:
+    """
+    A @ b contracts the genuinely shared dims and keeps the rest.
+
+    ``z`` has dims (dim_0, dim_1); ``b`` has (dim_1, location). Only dim_1
+    is shared, so the result must keep dim_0 and location. A conversion that
+    broadcast ``b`` to ``z``'s coords would expand dim_0 into ``b`` and
+    contract it away too — collapsing the result to (location,) only.
+    """
+    expr = 1 * z
+    b = xr.DataArray(
+        np.ones((3, 2)),
+        coords={"dim_1": expr.indexes["dim_1"], "location": ["L1", "L2"]},
+        dims=["dim_1", "location"],
+    )
+
+    res = expr @ b
+
+    assert set(res.coord_dims) == {"dim_0", "location"}
+    assert_linequal(res, (expr * b).sum("dim_1"))
+
+
+def test_matmul_contracts_all_dims_when_const_covers_them(z: Variable) -> None:
+    """B covering all of a's dims (and more) contracts a's dims, keeping b's extras."""
+    expr = 1 * z  # dims (dim_0, dim_1)
+    b = xr.DataArray(
+        np.ones((2, 3, 2)),
+        coords={
+            "dim_0": expr.indexes["dim_0"],
+            "dim_1": expr.indexes["dim_1"],
+            "location": ["L1", "L2"],
+        },
+        dims=["dim_0", "dim_1", "location"],
+    )
+
+    res = expr @ b
+
+    assert set(res.coord_dims) == {"location"}
+    assert_linequal(res, (expr * b).sum(["dim_0", "dim_1"]))
+
+
 def test_matmul_wrong_input(x: Variable, y: Variable, z: Variable) -> None:
     expr = 10 * x + y + z
     with pytest.raises(TypeError):
@@ -573,6 +606,498 @@ def test_linear_expression_multiplication_invalid(
     with pytest.raises(TypeError):
         expr = 10 * x + y + z
         expr / x
+
+
+class TestCoordinateAlignment:
+    @pytest.fixture(params=["da", "series"])
+    def subset(self, request: Any) -> xr.DataArray | pd.Series:
+        if request.param == "da":
+            return xr.DataArray([10.0, 30.0], dims=["dim_2"], coords={"dim_2": [1, 3]})
+        return pd.Series([10.0, 30.0], index=pd.Index([1, 3], name="dim_2"))
+
+    @pytest.fixture(params=["da", "series"])
+    def superset(self, request: Any) -> xr.DataArray | pd.Series:
+        if request.param == "da":
+            return xr.DataArray(
+                np.arange(25, dtype=float),
+                dims=["dim_2"],
+                coords={"dim_2": range(25)},
+            )
+        return pd.Series(
+            np.arange(25, dtype=float), index=pd.Index(range(25), name="dim_2")
+        )
+
+    @pytest.fixture
+    def expected_fill(self) -> np.ndarray:
+        arr = np.zeros(20)
+        arr[1] = 10.0
+        arr[3] = 30.0
+        return arr
+
+    @pytest.fixture(params=["xarray", "pandas_series"], ids=["da", "series"])
+    def nan_constant(self, request: Any) -> xr.DataArray | pd.Series:
+        vals = np.arange(20, dtype=float)
+        vals[0] = np.nan
+        vals[5] = np.nan
+        vals[19] = np.nan
+        if request.param == "xarray":
+            return xr.DataArray(vals, dims=["dim_2"], coords={"dim_2": range(20)})
+        return pd.Series(vals, index=pd.Index(range(20), name="dim_2"))
+
+    class TestSubset:
+        @pytest.mark.parametrize("operand", ["var", "expr"])
+        def test_mul_subset_fills_zeros(
+            self,
+            v: Variable,
+            subset: xr.DataArray,
+            expected_fill: np.ndarray,
+            operand: str,
+        ) -> None:
+            target = v if operand == "var" else 1 * v
+            result = target * subset
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.coeffs.values).any()
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, expected_fill)
+
+        @pytest.mark.parametrize("operand", ["var", "expr"])
+        def test_add_subset_fills_zeros(
+            self,
+            v: Variable,
+            subset: xr.DataArray,
+            expected_fill: np.ndarray,
+            operand: str,
+        ) -> None:
+            if operand == "var":
+                result = v + subset
+                expected = expected_fill
+            else:
+                result = (v + 5) + subset
+                expected = expected_fill + 5
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.const.values).any()
+            np.testing.assert_array_equal(result.const.values, expected)
+
+        @pytest.mark.parametrize("operand", ["var", "expr"])
+        def test_sub_subset_fills_negated(
+            self,
+            v: Variable,
+            subset: xr.DataArray,
+            expected_fill: np.ndarray,
+            operand: str,
+        ) -> None:
+            if operand == "var":
+                result = v - subset
+                expected = -expected_fill
+            else:
+                result = (v + 5) - subset
+                expected = 5 - expected_fill
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.const.values).any()
+            np.testing.assert_array_equal(result.const.values, expected)
+
+        @pytest.mark.parametrize("operand", ["var", "expr"])
+        def test_div_subset_inverts_nonzero(
+            self, v: Variable, subset: xr.DataArray, operand: str
+        ) -> None:
+            target = v if operand == "var" else 1 * v
+            result = target / subset
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.coeffs.values).any()
+            assert result.coeffs.squeeze().sel(dim_2=1).item() == pytest.approx(0.1)
+            assert result.coeffs.squeeze().sel(dim_2=0).item() == pytest.approx(1.0)
+
+        def test_subset_add_var_coefficients(
+            self, v: Variable, subset: xr.DataArray
+        ) -> None:
+            result = subset + v
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, np.ones(20))
+
+        def test_subset_sub_var_coefficients(
+            self, v: Variable, subset: xr.DataArray
+        ) -> None:
+            result = subset - v
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, -np.ones(20))
+
+    class TestSuperset:
+        def test_add_superset_pins_to_lhs_coords(
+            self, v: Variable, superset: xr.DataArray
+        ) -> None:
+            result = v + superset
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.const.values).any()
+
+        def test_add_var_commutative(self, v: Variable, superset: xr.DataArray) -> None:
+            assert_linequal(superset + v, v + superset)
+
+        def test_sub_var_commutative(self, v: Variable, superset: xr.DataArray) -> None:
+            assert_linequal(superset - v, -v + superset)
+
+        def test_mul_var_commutative(self, v: Variable, superset: xr.DataArray) -> None:
+            assert_linequal(superset * v, v * superset)
+
+        def test_mul_superset_pins_to_lhs_coords(
+            self, v: Variable, superset: xr.DataArray
+        ) -> None:
+            result = v * superset
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.coeffs.values).any()
+
+        def test_div_superset_pins_to_lhs_coords(self, v: Variable) -> None:
+            superset_nonzero = xr.DataArray(
+                np.arange(1, 26, dtype=float),
+                dims=["dim_2"],
+                coords={"dim_2": range(25)},
+            )
+            result = v / superset_nonzero
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.coeffs.values).any()
+
+    class TestDisjoint:
+        def test_add_disjoint_fills_zeros(self, v: Variable) -> None:
+            disjoint = xr.DataArray(
+                [100.0, 200.0], dims=["dim_2"], coords={"dim_2": [50, 60]}
+            )
+            result = v + disjoint
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.const.values).any()
+            np.testing.assert_array_equal(result.const.values, np.zeros(20))
+
+        def test_mul_disjoint_fills_zeros(self, v: Variable) -> None:
+            disjoint = xr.DataArray(
+                [10.0, 20.0], dims=["dim_2"], coords={"dim_2": [50, 60]}
+            )
+            result = v * disjoint
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.coeffs.values).any()
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, np.zeros(20))
+
+        def test_div_disjoint_preserves_coeffs(self, v: Variable) -> None:
+            disjoint = xr.DataArray(
+                [10.0, 20.0], dims=["dim_2"], coords={"dim_2": [50, 60]}
+            )
+            result = v / disjoint
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.coeffs.values).any()
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, np.ones(20))
+
+    class TestCommutativity:
+        @pytest.mark.parametrize(
+            "make_lhs,make_rhs",
+            [
+                (lambda v, s: s * v, lambda v, s: v * s),
+                (lambda v, s: s * (1 * v), lambda v, s: (1 * v) * s),
+                (lambda v, s: s + v, lambda v, s: v + s),
+                (lambda v, s: s + (v + 5), lambda v, s: (v + 5) + s),
+            ],
+            ids=["subset*var", "subset*expr", "subset+var", "subset+expr"],
+        )
+        def test_commutativity(
+            self,
+            v: Variable,
+            subset: xr.DataArray,
+            make_lhs: Any,
+            make_rhs: Any,
+        ) -> None:
+            assert_linequal(make_lhs(v, subset), make_rhs(v, subset))
+
+        def test_sub_var_anticommutative(
+            self, v: Variable, subset: xr.DataArray
+        ) -> None:
+            assert_linequal(subset - v, -v + subset)
+
+        def test_sub_expr_anticommutative(
+            self, v: Variable, subset: xr.DataArray
+        ) -> None:
+            expr = v + 5
+            assert_linequal(subset - expr, -(expr - subset))
+
+        def test_add_commutativity_full_coords(self, v: Variable) -> None:
+            full = xr.DataArray(
+                np.arange(20, dtype=float),
+                dims=["dim_2"],
+                coords={"dim_2": range(20)},
+            )
+            assert_linequal(v + full, full + v)
+
+    class TestQuadratic:
+        def test_quadexpr_add_subset(
+            self,
+            v: Variable,
+            subset: xr.DataArray,
+            expected_fill: np.ndarray,
+        ) -> None:
+            qexpr = v * v
+            result = qexpr + subset
+            assert isinstance(result, QuadraticExpression)
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.const.values).any()
+            np.testing.assert_array_equal(result.const.values, expected_fill)
+
+        def test_quadexpr_sub_subset(
+            self,
+            v: Variable,
+            subset: xr.DataArray,
+            expected_fill: np.ndarray,
+        ) -> None:
+            qexpr = v * v
+            result = qexpr - subset
+            assert isinstance(result, QuadraticExpression)
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.const.values).any()
+            np.testing.assert_array_equal(result.const.values, -expected_fill)
+
+        def test_quadexpr_mul_subset(
+            self,
+            v: Variable,
+            subset: xr.DataArray,
+            expected_fill: np.ndarray,
+        ) -> None:
+            qexpr = v * v
+            result = qexpr * subset
+            assert isinstance(result, QuadraticExpression)
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.coeffs.values).any()
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, expected_fill)
+
+        def test_subset_mul_quadexpr(
+            self,
+            v: Variable,
+            subset: xr.DataArray,
+            expected_fill: np.ndarray,
+        ) -> None:
+            qexpr = v * v
+            result = subset * qexpr
+            assert isinstance(result, QuadraticExpression)
+            assert result.sizes["dim_2"] == v.sizes["dim_2"]
+            assert not np.isnan(result.coeffs.values).any()
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, expected_fill)
+
+        def test_subset_add_quadexpr(self, v: Variable, subset: xr.DataArray) -> None:
+            qexpr = v * v
+            assert_quadequal(subset + qexpr, qexpr + subset)
+
+    class TestMissingValues:
+        """
+        Same shape as variable but with NaN entries in the constant.
+
+        NaN values are filled with operation-specific neutral elements:
+        - Addition/subtraction: NaN -> 0 (additive identity)
+        - Multiplication: NaN -> 0 (zeroes out the variable)
+        - Division: NaN -> 1 (multiplicative identity, no scaling)
+        """
+
+        NAN_POSITIONS = [0, 5, 19]
+
+        @pytest.mark.parametrize("operand", ["var", "expr"])
+        def test_add_nan_filled(
+            self,
+            v: Variable,
+            nan_constant: xr.DataArray | pd.Series,
+            operand: str,
+        ) -> None:
+            base_const = 0.0 if operand == "var" else 5.0
+            target = v if operand == "var" else v + 5
+            result = target + nan_constant
+            assert result.sizes["dim_2"] == 20
+            assert not np.isnan(result.const.values).any()
+            # At NaN positions, const should be unchanged (added 0)
+            for i in self.NAN_POSITIONS:
+                assert result.const.values[i] == base_const
+
+        @pytest.mark.parametrize("operand", ["var", "expr"])
+        def test_sub_nan_filled(
+            self,
+            v: Variable,
+            nan_constant: xr.DataArray | pd.Series,
+            operand: str,
+        ) -> None:
+            base_const = 0.0 if operand == "var" else 5.0
+            target = v if operand == "var" else v + 5
+            result = target - nan_constant
+            assert result.sizes["dim_2"] == 20
+            assert not np.isnan(result.const.values).any()
+            # At NaN positions, const should be unchanged (subtracted 0)
+            for i in self.NAN_POSITIONS:
+                assert result.const.values[i] == base_const
+
+        @pytest.mark.parametrize("operand", ["var", "expr"])
+        def test_mul_nan_filled(
+            self,
+            v: Variable,
+            nan_constant: xr.DataArray | pd.Series,
+            operand: str,
+        ) -> None:
+            target = v if operand == "var" else 1 * v
+            result = target * nan_constant
+            assert result.sizes["dim_2"] == 20
+            assert not np.isnan(result.coeffs.squeeze().values).any()
+            # At NaN positions, coeffs should be 0 (variable zeroed out)
+            for i in self.NAN_POSITIONS:
+                assert result.coeffs.squeeze().values[i] == 0.0
+
+        @pytest.mark.parametrize("operand", ["var", "expr"])
+        def test_div_nan_filled(
+            self,
+            v: Variable,
+            nan_constant: xr.DataArray | pd.Series,
+            operand: str,
+        ) -> None:
+            target = v if operand == "var" else 1 * v
+            result = target / nan_constant
+            assert result.sizes["dim_2"] == 20
+            assert not np.isnan(result.coeffs.squeeze().values).any()
+            # At NaN positions, coeffs should be unchanged (divided by 1)
+            original_coeffs = (1 * v).coeffs.squeeze().values
+            for i in self.NAN_POSITIONS:
+                assert result.coeffs.squeeze().values[i] == original_coeffs[i]
+
+        def test_add_commutativity(
+            self,
+            v: Variable,
+            nan_constant: xr.DataArray | pd.Series,
+        ) -> None:
+            result_a = v + nan_constant
+            result_b = nan_constant + v
+            assert not np.isnan(result_a.const.values).any()
+            assert not np.isnan(result_b.const.values).any()
+            np.testing.assert_array_equal(result_a.const.values, result_b.const.values)
+            np.testing.assert_array_equal(
+                result_a.coeffs.values, result_b.coeffs.values
+            )
+
+        def test_mul_commutativity(
+            self,
+            v: Variable,
+            nan_constant: xr.DataArray | pd.Series,
+        ) -> None:
+            result_a = v * nan_constant
+            result_b = nan_constant * v
+            assert not np.isnan(result_a.coeffs.values).any()
+            assert not np.isnan(result_b.coeffs.values).any()
+            np.testing.assert_array_equal(
+                result_a.coeffs.values, result_b.coeffs.values
+            )
+
+        def test_quadexpr_add_nan(
+            self,
+            v: Variable,
+            nan_constant: xr.DataArray | pd.Series,
+        ) -> None:
+            qexpr = v * v
+            result = qexpr + nan_constant
+            assert isinstance(result, QuadraticExpression)
+            assert result.sizes["dim_2"] == 20
+            assert not np.isnan(result.const.values).any()
+
+    class TestExpressionWithNaN:
+        """Test that NaN in expression's own const/coeffs doesn't propagate."""
+
+        def test_shifted_expr_add_scalar(self, v: Variable) -> None:
+            expr = (1 * v).shift(dim_2=1)
+            result = expr + 5
+            assert not np.isnan(result.const.values).any()
+            assert result.const.values[0] == 5.0
+
+        def test_shifted_expr_mul_scalar(self, v: Variable) -> None:
+            expr = (1 * v).shift(dim_2=1)
+            result = expr * 2
+            assert not np.isnan(result.coeffs.squeeze().values).any()
+            assert result.coeffs.squeeze().values[0] == 0.0
+
+        def test_shifted_expr_add_array(self, v: Variable) -> None:
+            arr = np.arange(v.sizes["dim_2"], dtype=float)
+            expr = (1 * v).shift(dim_2=1)
+            result = expr + arr
+            assert not np.isnan(result.const.values).any()
+            assert result.const.values[0] == 0.0
+
+        def test_shifted_expr_mul_array(self, v: Variable) -> None:
+            arr = np.arange(v.sizes["dim_2"], dtype=float) + 1
+            expr = (1 * v).shift(dim_2=1)
+            result = expr * arr
+            assert not np.isnan(result.coeffs.squeeze().values).any()
+            assert result.coeffs.squeeze().values[0] == 0.0
+
+        def test_shifted_expr_div_scalar(self, v: Variable) -> None:
+            expr = (1 * v).shift(dim_2=1)
+            result = expr / 2
+            assert not np.isnan(result.coeffs.squeeze().values).any()
+            assert result.coeffs.squeeze().values[0] == 0.0
+
+        def test_shifted_expr_sub_scalar(self, v: Variable) -> None:
+            expr = (1 * v).shift(dim_2=1)
+            result = expr - 3
+            assert not np.isnan(result.const.values).any()
+            assert result.const.values[0] == -3.0
+
+        def test_shifted_expr_div_array(self, v: Variable) -> None:
+            arr = np.arange(v.sizes["dim_2"], dtype=float) + 1
+            expr = (1 * v).shift(dim_2=1)
+            result = expr / arr
+            assert not np.isnan(result.coeffs.squeeze().values).any()
+            assert result.coeffs.squeeze().values[0] == 0.0
+
+        def test_variable_to_linexpr_nan_coefficient(self, v: Variable) -> None:
+            nan_coeff = np.ones(v.sizes["dim_2"])
+            nan_coeff[0] = np.nan
+            result = v.to_linexpr(nan_coeff)
+            assert not np.isnan(result.coeffs.squeeze().values).any()
+            assert result.coeffs.squeeze().values[0] == 0.0
+
+    class TestMultiDim:
+        def test_multidim_subset_mul(self, m: Model) -> None:
+            coords_a = pd.RangeIndex(4, name="a")
+            coords_b = pd.RangeIndex(5, name="b")
+            w = m.add_variables(coords=[coords_a, coords_b], name="w")
+
+            subset_2d = xr.DataArray(
+                [[2.0, 3.0], [4.0, 5.0]],
+                dims=["a", "b"],
+                coords={"a": [1, 3], "b": [0, 4]},
+            )
+            result = w * subset_2d
+            assert result.sizes["a"] == 4
+            assert result.sizes["b"] == 5
+            assert not np.isnan(result.coeffs.values).any()
+            assert result.coeffs.squeeze().sel(a=1, b=0).item() == pytest.approx(2.0)
+            assert result.coeffs.squeeze().sel(a=3, b=4).item() == pytest.approx(5.0)
+            assert result.coeffs.squeeze().sel(a=0, b=0).item() == pytest.approx(0.0)
+            assert result.coeffs.squeeze().sel(a=1, b=2).item() == pytest.approx(0.0)
+
+        def test_multidim_subset_add(self, m: Model) -> None:
+            coords_a = pd.RangeIndex(4, name="a")
+            coords_b = pd.RangeIndex(5, name="b")
+            w = m.add_variables(coords=[coords_a, coords_b], name="w")
+
+            subset_2d = xr.DataArray(
+                [[2.0, 3.0], [4.0, 5.0]],
+                dims=["a", "b"],
+                coords={"a": [1, 3], "b": [0, 4]},
+            )
+            result = w + subset_2d
+            assert result.sizes["a"] == 4
+            assert result.sizes["b"] == 5
+            assert not np.isnan(result.const.values).any()
+            assert result.const.sel(a=1, b=0).item() == pytest.approx(2.0)
+            assert result.const.sel(a=3, b=4).item() == pytest.approx(5.0)
+            assert result.const.sel(a=0, b=0).item() == pytest.approx(0.0)
+
+    class TestXarrayCompat:
+        def test_da_eq_da_still_works(self) -> None:
+            da1 = xr.DataArray([1, 2, 3])
+            da2 = xr.DataArray([1, 2, 3])
+            result = da1 == da2
+            assert result.values.all()
+
+        def test_da_eq_scalar_still_works(self) -> None:
+            da = xr.DataArray([1, 2, 3])
+            result = da == 2
+            np.testing.assert_array_equal(result.values, [False, True, False])
+
+        def test_da_truediv_var_raises(self, v: Variable) -> None:
+            da = xr.DataArray(np.ones(20), dims=["dim_2"], coords={"dim_2": range(20)})
+            with pytest.raises(TypeError):
+                da / v  # type: ignore[operator]
 
 
 def test_expression_inherited_properties(x: Variable, y: Variable) -> None:
@@ -630,6 +1155,56 @@ def test_linear_expression_isnull(v: Variable) -> None:
     filter = (expr.coeffs >= 10).any(TERM_DIM)
     expr = expr.where(filter)
     assert expr.isnull().sum() == 10
+
+
+class TestHasTerms:
+    """has_terms: true at slots with at least one live term, regardless of the constant."""
+
+    def test_basic_and_masking(self, v: Variable) -> None:
+        expr = np.arange(20) * v
+        assert expr.has_terms.all()
+
+        filter = (expr.coeffs >= 10).any(TERM_DIM)
+        masked = expr.where(filter)
+        assert_equal(masked.has_terms, filter.rename("has_terms"))
+
+    def test_ignores_const(self, v: Variable) -> None:
+        # has_terms differs from isnull() at slots whose constant was revived by
+        # fillna: no longer null, but still without terms
+        expr = np.arange(20) * v
+        filter = (expr.coeffs >= 10).any(TERM_DIM)
+        masked = expr.where(filter)
+        assert_equal(masked.isnull(), ~masked.has_terms)
+
+        filled = masked.fillna(0)
+        assert not filled.isnull().any()
+        assert_equal(filled.has_terms, filter.rename("has_terms"))
+
+    def test_merge_reindex(self, x: Variable, y: Variable) -> None:
+        # the nodal-balance pattern: outer merge, then reindex to a superset of
+        # coordinates; slots beyond the original coordinates carry no terms
+        lhs = merge([1 * x, 1 * y], join="outer").reindex(
+            dim_0=pd.RangeIndex(4, name="dim_0")
+        )
+        assert lhs.has_terms.values.tolist() == [True, True, False, False]
+
+    def test_constant_only(self, m: Model) -> None:
+        expr = LinearExpression(xr.DataArray([1, 2], dims=["dim_0"]), m)
+        assert expr.nterm == 0
+        assert not expr.has_terms.any()
+
+    def test_quadratic(self, v: Variable) -> None:
+        # linear terms inside a quadratic expression carry one factor == -1;
+        # they must still count as live terms
+        quad = v * v + 2 * v
+        assert quad.has_terms.all()
+        assert TERM_DIM not in quad.has_terms.dims
+
+        filter = xr.DataArray(
+            np.arange(20) >= 10, dims="dim_2", coords={"dim_2": range(20)}
+        )
+        masked = quad.where(filter)
+        assert_equal(masked.has_terms, filter.rename("has_terms"))
 
 
 def test_linear_expression_flat(v: Variable) -> None:
@@ -808,6 +1383,288 @@ def test_linear_expression_groupby_on_same_name_as_target_dim(
     assert "group" in grouped.dims
     assert (grouped.data.group == [1, 2]).all()
     assert grouped.nterm == 10
+
+
+class TestMultiKeyFastPath:
+    """
+    Group a LinearExpression by a list of coordinate names: takes the fast
+    reindex path and returns one dimension per key, like the xarray fallback.
+    """
+
+    @staticmethod
+    def _expr(period_vals: list, season_vals: list) -> LinearExpression:
+        n = len(period_vals)
+        s = pd.RangeIndex(n, name="s")
+        m = Model()
+        x = m.add_variables(coords=[s], name="x")
+        return (1.0 * x).assign_coords(
+            period=xr.DataArray(period_vals, dims="s", coords={"s": s}, name="period"),
+            season=xr.DataArray(season_vals, dims="s", coords={"s": s}, name="season"),
+        )
+
+    @pytest.mark.parametrize("spelling", [list, tuple], ids=["list", "tuple"])
+    def test_matches_fallback(self, spelling: type) -> None:
+        # the fast path must equal the slow fallback, sparse cells included
+        expr = self._expr([2020, 2020, 2030, 2030, 2030], list("wswws"))
+        group = spelling(["period", "season"])
+
+        fast = expr.groupby(group).sum()
+        slow = expr.groupby(group).sum(use_fallback=True)
+
+        assert_linequal(fast, slow)
+
+    def test_separate_dims_not_stacked(self) -> None:
+        # built via a stacked index internally, but returns one dim per key
+        expr = self._expr([2020, 2020, 2030, 2030], list("wsws"))
+
+        grouped = expr.groupby(["period", "season"]).sum()
+
+        assert {"period", "season"} <= set(grouped.dims)
+        assert "group" not in grouped.dims
+        assert not isinstance(grouped.data.indexes.get("period"), pd.MultiIndex)
+
+    def test_sparse_combination_filled(self) -> None:
+        # (2020, "s") never occurs -> empty term in the grid
+        expr = self._expr([2020, 2020, 2030, 2030], list("wwws"))
+
+        grouped = expr.groupby(["period", "season"]).sum()
+
+        cell = grouped.sel(period=2020, season="s")
+        assert (cell.vars == -1).all()
+        assert cell.coeffs.isnull().all()
+
+    def test_dataframe_grouper_stays_compact(self) -> None:
+        # the DataFrame grouper keeps the stacked observed-only group dim
+        expr = self._expr([2020, 2020, 2030, 2030], list("wwws"))
+        df = expr.data[["period", "season"]].to_dataframe()[["period", "season"]]
+
+        grouped = expr.groupby(df).sum()
+
+        assert "group" in grouped.dims
+        assert isinstance(grouped.data.indexes["group"], pd.MultiIndex)
+        assert grouped.sizes["group"] == 3  # observed, not the 2x2=4 grid
+
+    def test_blowup_warns_when_sparse(self) -> None:
+        # 200 observed combos, 200x200 grid -> nudge toward observed=True
+        expr = self._expr(list(range(200)), list(range(200)))
+
+        with pytest.warns(UserWarning, match="dense .* grid"):
+            expr.groupby(["period", "season"]).sum()
+
+    def test_no_warning_when_dense(self) -> None:
+        expr = self._expr([2020, 2020, 2030, 2030], list("wsws"))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            expr.groupby(["period", "season"]).sum()
+
+    def test_observed_keeps_stacked(self) -> None:
+        # observed=True skips the unstack: compact stacked MultiIndex,
+        # identical to the DataFrame grouper output
+        expr = self._expr([2020, 2020, 2030, 2030], list("wwws"))
+        df = expr.data[["period", "season"]].to_dataframe()[["period", "season"]]
+
+        grouped = expr.groupby(["period", "season"]).sum(observed=True)
+
+        assert_linequal(grouped, expr.groupby(df).sum())
+        assert grouped.sizes["group"] == 3  # observed, not the 2x2=4 grid
+
+    def test_observed_silences_blowup_warning(self) -> None:
+        expr = self._expr(list(range(200)), list(range(200)))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            grouped = expr.groupby(["period", "season"]).sum(observed=True)
+
+        assert grouped.sizes["group"] == 200
+
+    def test_observed_with_fallback_raises(self) -> None:
+        expr = self._expr([2020, 2020], list("ws"))
+
+        with pytest.raises(ValueError, match="observed"):
+            expr.groupby(["period", "season"]).sum(use_fallback=True, observed=True)
+
+
+class TestGroupbyByAttachedCoordinate:
+    """
+    Group by an attached non-dimension coordinate.
+
+    Asserts grouping against hard-coded ``vars``/``coeffs`` to catch regressions.
+    """
+
+    @pytest.fixture
+    def t(self) -> pd.RangeIndex:
+        return pd.RangeIndex(4, name="t")
+
+    @pytest.fixture
+    def period(self, t: pd.RangeIndex) -> xr.DataArray:
+        return xr.DataArray(
+            [2020, 2020, 2030, 2030], dims="t", coords={"t": t}, name="period"
+        )
+
+    @pytest.fixture
+    def season(self, t: pd.RangeIndex) -> xr.DataArray:
+        return xr.DataArray(list("wsws"), dims="t", coords={"t": t}, name="season")
+
+    @pytest.fixture
+    def expr(
+        self, t: pd.RangeIndex, period: xr.DataArray, season: xr.DataArray
+    ) -> LinearExpression:
+        m = Model()
+        x = m.add_variables(coords=[t], name="x")
+        return (2.0 * x).assign_coords(period=period, season=season)
+
+    @pytest.mark.parametrize("use_fallback", [True, False])
+    @pytest.mark.parametrize("by", ["name", "dataarray"])
+    def test_single_key(
+        self,
+        expr: LinearExpression,
+        period: xr.DataArray,
+        by: str,
+        use_fallback: bool,
+    ) -> None:
+        group = "period" if by == "name" else period
+
+        grouped = expr.groupby(group).sum(use_fallback=use_fallback)
+
+        assert grouped.data.period.values.tolist() == [2020, 2030]
+        assert grouped.vars.transpose("period", TERM_DIM).values.tolist() == [
+            [0, 1],
+            [2, 3],
+        ]
+        assert grouped.coeffs.transpose("period", TERM_DIM).values.tolist() == [
+            [2.0, 2.0],
+            [2.0, 2.0],
+        ]
+
+    @pytest.mark.parametrize("spelling", [list, tuple], ids=["list", "tuple"])
+    def test_multi_key(self, expr: LinearExpression, spelling: type) -> None:
+        # A multi-key group always goes through the xarray fallback (a list is
+        # not a fast-path type), so there is no separate use_fallback case.
+        group = spelling(["period", "season"])
+
+        grouped = expr.groupby(group).sum()
+
+        assert dict(grouped.sizes) == {"period": 2, "season": 2, TERM_DIM: 1}
+        assert grouped.data.period.values.tolist() == [2020, 2030]
+        assert grouped.data.season.values.tolist() == ["s", "w"]
+        assert grouped.vars.transpose("period", "season", TERM_DIM).values.tolist() == [
+            [[1], [0]],
+            [[3], [2]],
+        ]
+        assert (grouped.coeffs == 2.0).all()
+
+    def test_extra_aux_coord_does_not_change_result(
+        self, t: pd.RangeIndex, period: xr.DataArray
+    ) -> None:
+        # A second auxiliary coord on the grouped dimension must neither break
+        # the reshape (it raised ``KeyError`` before the fix) nor change the sum.
+        m = Model()
+        x = m.add_variables(coords=[t], name="x")
+        timestep = xr.DataArray(
+            list("abab"), dims="t", coords={"t": t}, name="timestep"
+        )
+        expr = (2.0 * x).assign_coords(period=period, timestep=timestep)
+
+        grouped = expr.groupby("period").sum()
+
+        assert "timestep" not in grouped.coords
+        assert grouped.vars.transpose("period", TERM_DIM).values.tolist() == [
+            [0, 1],
+            [2, 3],
+        ]
+        assert (grouped.coeffs == 2.0).all()
+
+    @pytest.mark.parametrize("by", ["name", "dataarray"])
+    def test_two_dimensional(self, by: str) -> None:
+        # Grouping one dimension of a 2-D variable by an aux coord must keep the
+        # other dimension intact and pair up the right variable labels.
+        m = Model()
+        snapshot = pd.RangeIndex(4, name="snapshot")
+        gen = pd.Index(["g1", "g2"], name="gen")
+        y = m.add_variables(coords=[snapshot, gen], name="y")  # labels 0..7
+        period = xr.DataArray(
+            [2020, 2020, 2030, 2030],
+            dims="snapshot",
+            coords={"snapshot": snapshot},
+            name="period",
+        )
+        expr = (1.0 * y).assign_coords(period=period)
+        group = "period" if by == "name" else period
+
+        grouped = expr.groupby(group).sum()
+
+        assert grouped.data.period.values.tolist() == [2020, 2030]
+        assert grouped.data.gen.values.tolist() == ["g1", "g2"]
+        assert grouped.vars.transpose("period", "gen", TERM_DIM).values.tolist() == [
+            [[0, 2], [1, 3]],
+            [[4, 6], [5, 7]],
+        ]
+        assert (grouped.coeffs == 1.0).all()
+
+    @pytest.mark.parametrize("use_fallback", [True, False])
+    def test_dimension_coordinate_by_name(self, use_fallback: bool) -> None:
+        # A dimension coordinate may also be grouped by name; it collapses that
+        # dimension and keeps the other one.
+        m = Model()
+        snapshot = pd.RangeIndex(4, name="snapshot")
+        gen = pd.Index(["g1", "g2"], name="gen")
+        y = m.add_variables(coords=[snapshot, gen], name="y")  # labels 0..7
+
+        grouped = (1 * y).groupby("gen").sum(use_fallback=use_fallback)
+
+        assert grouped.data.gen.values.tolist() == ["g1", "g2"]
+        assert grouped.sizes["snapshot"] == 4
+        assert grouped.vars.transpose("gen", "snapshot", TERM_DIM).values.tolist() == [
+            [[0], [2], [4], [6]],
+            [[1], [3], [5], [7]],
+        ]
+
+    @pytest.mark.parametrize("use_fallback", [True, False])
+    def test_single_element_list_groups_like_scalar(
+        self, expr: LinearExpression, use_fallback: bool
+    ) -> None:
+        # ``groupby(["period"])`` groups like the scalar key, mirroring xarray.
+        grouped = expr.groupby(["period"]).sum(use_fallback=use_fallback)
+
+        assert grouped.data.period.values.tolist() == [2020, 2030]
+        assert grouped.vars.transpose("period", TERM_DIM).values.tolist() == [
+            [0, 1],
+            [2, 3],
+        ]
+        assert (grouped.coeffs == 2.0).all()
+
+    def test_multi_key_dataarrays_unsupported(
+        self, expr: LinearExpression, period: xr.DataArray, season: xr.DataArray
+    ) -> None:
+        # Multi-key grouping must be spelled with names; a list of DataArrays
+        # is unhashable and raises in xarray itself, so linopy mirrors that.
+        with pytest.raises(TypeError, match="unhashable"):
+            expr.groupby([period, season]).sum()
+
+    @pytest.mark.parametrize("use_fallback", [True, False])
+    @pytest.mark.parametrize(
+        "level, values, vars_",
+        [
+            ("period", [2020, 2030], [[0, 1, 2], [3, 4, 5]]),
+            ("timestep", ["t1", "t2", "t3"], [[0, 3], [1, 4], [2, 5]]),
+        ],
+    )
+    def test_multiindex_level(
+        self, level: str, values: list, vars_: list, use_fallback: bool
+    ) -> None:
+        # Grouping by a level of a real ``MultiIndex`` dimension (the
+        # pydata/xarray#6836 case, fixed upstream) works through linopy.
+        m = Model()
+        mi = pd.MultiIndex.from_product(
+            [[2020, 2030], ["t1", "t2", "t3"]], names=["period", "timestep"]
+        )
+        x = m.add_variables(coords={"snapshot": mi}, name="x")  # labels 0..5
+
+        grouped = (1 * x).groupby(level).sum(use_fallback=use_fallback)
+
+        assert grouped.data[level].values.tolist() == values
+        assert grouped.vars.transpose(level, TERM_DIM).values.tolist() == vars_
 
 
 @pytest.mark.parametrize("use_fallback", [True])
@@ -1313,3 +2170,450 @@ def test_simplify_partial_cancellation(x: Variable, y: Variable) -> None:
     assert all(simplified.coeffs.values == 3.0), (
         f"Expected coefficient 3.0, got {simplified.coeffs.values}"
     )
+
+
+def test_constant_only_expression_mul_dataarray(m: Model) -> None:
+    const_arr = xr.DataArray([2, 3], dims=["dim_0"])
+    const_expr = LinearExpression(const_arr, m)
+    assert const_expr.is_constant
+    assert const_expr.nterm == 0
+
+    data_arr = xr.DataArray([10, 20], dims=["dim_0"])
+    expected_const = const_arr * data_arr
+
+    result = const_expr * data_arr
+    assert isinstance(result, LinearExpression)
+    assert result.is_constant
+    assert (result.const == expected_const).all()
+
+    result_rev = data_arr * const_expr
+    assert isinstance(result_rev, LinearExpression)
+    assert result_rev.is_constant
+    assert (result_rev.const == expected_const).all()
+
+
+def test_constant_only_expression_mul_linexpr_with_vars(m: Model, x: Variable) -> None:
+    const_arr = xr.DataArray([2, 3], dims=["dim_0"])
+    const_expr = LinearExpression(const_arr, m)
+    assert const_expr.is_constant
+    assert const_expr.nterm == 0
+
+    expr_with_vars = 1 * x + 5
+    expected_coeffs = const_arr
+    expected_const = const_arr * 5
+
+    result = const_expr * expr_with_vars
+    assert isinstance(result, LinearExpression)
+    assert (result.coeffs == expected_coeffs).all()
+    assert (result.const == expected_const).all()
+
+    result_rev = expr_with_vars * const_expr
+    assert isinstance(result_rev, LinearExpression)
+    assert (result_rev.coeffs == expected_coeffs).all()
+    assert (result_rev.const == expected_const).all()
+
+
+def test_constant_only_expression_mul_constant_only(m: Model) -> None:
+    const_arr = xr.DataArray([2, 3], dims=["dim_0"])
+    const_arr2 = xr.DataArray([4, 5], dims=["dim_0"])
+    const_expr = LinearExpression(const_arr, m)
+    const_expr2 = LinearExpression(const_arr2, m)
+    assert const_expr.is_constant
+    assert const_expr2.is_constant
+
+    expected_const = const_arr * const_arr2
+
+    result = const_expr * const_expr2
+    assert isinstance(result, LinearExpression)
+    assert result.is_constant
+    assert (result.const == expected_const).all()
+
+    result_rev = const_expr2 * const_expr
+    assert isinstance(result_rev, LinearExpression)
+    assert result_rev.is_constant
+    assert (result_rev.const == expected_const).all()
+
+
+def test_constant_only_expression_mul_linexpr_with_vars_and_const(
+    m: Model, x: Variable
+) -> None:
+    const_arr = xr.DataArray([2, 3], dims=["dim_0"])
+    const_expr = LinearExpression(const_arr, m)
+    assert const_expr.is_constant
+
+    expr_with_vars_and_const = 4 * x + 10
+    expected_coeffs = const_arr * 4
+    expected_const = const_arr * 10
+
+    result = const_expr * expr_with_vars_and_const
+    assert isinstance(result, LinearExpression)
+    assert not result.is_constant
+    assert (result.coeffs == expected_coeffs).all()
+    assert (result.const == expected_const).all()
+
+    result_rev = expr_with_vars_and_const * const_expr
+    assert isinstance(result_rev, LinearExpression)
+    assert not result_rev.is_constant
+    assert (result_rev.coeffs == expected_coeffs).all()
+    assert (result_rev.const == expected_const).all()
+
+
+def test_variable_names() -> None:
+    m = Model()
+    time = pd.Index(range(3), name="time")
+
+    a = m.add_variables(name="a", coords=[time])
+    b = m.add_variables(name="b", coords=[time])
+
+    expr = a + b
+    assert expr.nterm == 2
+    assert expr.variable_names == {"a", "b"}
+
+    mask = xr.DataArray(False, coords=[time])
+    expr = a + (b * 1).where(mask)
+    assert expr.nterm == 2
+    assert expr.variable_names == {"a"}
+
+    expr = (b * 1).where(mask)
+    assert expr.nterm == 1
+    assert expr.variable_names == set()
+
+    expr = LinearExpression.from_constant(model=m, constant=5)
+    assert expr.nterm == 0
+    assert expr.variable_names == set()
+
+    # Single variable expression
+    expr = 1 * a
+    assert expr.variable_names == {"a"}
+
+    # Repeated variable across terms (a + a)
+    expr = a + a
+    assert expr.variable_names == {"a"}
+
+
+def test_nterm() -> None:
+    m = Model()
+    time = pd.Index(range(3), name="time")
+    all_false = xr.DataArray(False, coords=[time])
+    not_0 = xr.DataArray([False, True, True], coords=[time])
+    not_1 = xr.DataArray([True, False, True], coords=[time])
+    not_2 = xr.DataArray([True, True, False], coords=[time])
+
+    a = m.add_variables(name="a", coords=[time])
+    b = m.add_variables(name="b", coords=[time])
+    c = m.add_variables(name="c", coords=[time])
+
+    expr = (a.where(not_0) + b.where(not_1) + c.where(not_2)).densify_terms()
+    assert expr.nterm == 3
+
+    expr = a + b.where(all_false)
+    assert expr.nterm == 2
+
+    expr = expr.simplify()
+    assert expr.nterm == 1
+
+
+class TestJoinParameter:
+    @pytest.fixture
+    def m2(self) -> Model:
+        m = Model()
+        m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="a")
+        m.add_variables(coords=[pd.Index([1, 2, 3], name="i")], name="b")
+        m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="c")
+        return m
+
+    @pytest.fixture
+    def a(self, m2: Model) -> Variable:
+        return m2.variables["a"]
+
+    @pytest.fixture
+    def b(self, m2: Model) -> Variable:
+        return m2.variables["b"]
+
+    @pytest.fixture
+    def c(self, m2: Model) -> Variable:
+        return m2.variables["c"]
+
+    class TestAddition:
+        def test_add_join_none_preserves_default(
+            self, a: Variable, b: Variable
+        ) -> None:
+            result_default = a.to_linexpr() + b.to_linexpr()
+            result_none = a.to_linexpr().add(b.to_linexpr(), join=None)
+            assert_linequal(result_default, result_none)
+
+        def test_add_expr_join_inner(self, a: Variable, b: Variable) -> None:
+            result = a.to_linexpr().add(b.to_linexpr(), join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_add_expr_join_outer(self, a: Variable, b: Variable) -> None:
+            result = a.to_linexpr().add(b.to_linexpr(), join="outer")
+            assert list(result.indexes["i"]) == [0, 1, 2, 3]
+
+        def test_add_expr_join_left(self, a: Variable, b: Variable) -> None:
+            result = a.to_linexpr().add(b.to_linexpr(), join="left")
+            assert list(result.indexes["i"]) == [0, 1, 2]
+
+        def test_add_expr_join_right(self, a: Variable, b: Variable) -> None:
+            result = a.to_linexpr().add(b.to_linexpr(), join="right")
+            assert list(result.indexes["i"]) == [1, 2, 3]
+
+        def test_add_constant_join_inner(self, a: Variable) -> None:
+            const = xr.DataArray([10, 20, 30], dims=["i"], coords={"i": [1, 2, 3]})
+            result = a.to_linexpr().add(const, join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_add_constant_join_outer(self, a: Variable) -> None:
+            const = xr.DataArray([10, 20, 30], dims=["i"], coords={"i": [1, 2, 3]})
+            result = a.to_linexpr().add(const, join="outer")
+            assert list(result.indexes["i"]) == [0, 1, 2, 3]
+
+        def test_add_constant_join_override(self, a: Variable, c: Variable) -> None:
+            expr = a.to_linexpr()
+            const = xr.DataArray([10, 20, 30], dims=["i"], coords={"i": [0, 1, 2]})
+            result = expr.add(const, join="override")
+            assert list(result.indexes["i"]) == [0, 1, 2]
+            assert (result.const.values == const.values).all()
+
+        def test_add_same_coords_all_joins(self, a: Variable, c: Variable) -> None:
+            expr_a = 1 * a + 5
+            const = xr.DataArray([1, 2, 3], dims=["i"], coords={"i": [0, 1, 2]})
+            joins: list[JoinOptions] = ["override", "outer", "inner"]
+            for join in joins:
+                result = expr_a.add(const, join=join)
+                assert list(result.coords["i"].values) == [0, 1, 2]
+                np.testing.assert_array_equal(result.const.values, [6, 7, 8])
+
+        def test_add_scalar_with_explicit_join(self, a: Variable) -> None:
+            expr = 1 * a + 5
+            result = expr.add(10, join="override")
+            np.testing.assert_array_equal(result.const.values, [15, 15, 15])
+            assert list(result.coords["i"].values) == [0, 1, 2]
+
+    class TestSubtraction:
+        def test_sub_expr_join_inner(self, a: Variable, b: Variable) -> None:
+            result = a.to_linexpr().sub(b.to_linexpr(), join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_sub_constant_override(self, a: Variable) -> None:
+            expr = 1 * a + 5
+            other = xr.DataArray([10, 20, 30], dims=["i"], coords={"i": [5, 6, 7]})
+            result = expr.sub(other, join="override")
+            assert list(result.coords["i"].values) == [0, 1, 2]
+            np.testing.assert_array_equal(result.const.values, [-5, -15, -25])
+
+    class TestMultiplication:
+        def test_mul_constant_join_inner(self, a: Variable) -> None:
+            const = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [1, 2, 3]})
+            result = a.to_linexpr().mul(const, join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_mul_constant_join_outer(self, a: Variable) -> None:
+            const = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [1, 2, 3]})
+            result = a.to_linexpr().mul(const, join="outer")
+            assert list(result.indexes["i"]) == [0, 1, 2, 3]
+            assert result.coeffs.sel(i=0).item() == 0
+            assert result.coeffs.sel(i=1).item() == 2
+            assert result.coeffs.sel(i=2).item() == 3
+
+        def test_mul_expr_with_join_raises(self, a: Variable, b: Variable) -> None:
+            with pytest.raises(TypeError, match="join parameter is not supported"):
+                a.to_linexpr().mul(b.to_linexpr(), join="inner")
+
+    class TestDivision:
+        def test_div_constant_join_inner(self, a: Variable) -> None:
+            const = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [1, 2, 3]})
+            result = a.to_linexpr().div(const, join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_div_constant_join_outer(self, a: Variable) -> None:
+            const = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [1, 2, 3]})
+            result = a.to_linexpr().div(const, join="outer")
+            assert list(result.indexes["i"]) == [0, 1, 2, 3]
+
+        def test_div_expr_with_join_raises(self, a: Variable, b: Variable) -> None:
+            with pytest.raises(TypeError):
+                a.to_linexpr().div(b.to_linexpr(), join="outer")
+
+    class TestVariableOperations:
+        def test_variable_add_join(self, a: Variable, b: Variable) -> None:
+            result = a.add(b, join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_variable_sub_join(self, a: Variable, b: Variable) -> None:
+            result = a.sub(b, join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_variable_mul_join(self, a: Variable) -> None:
+            const = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [1, 2, 3]})
+            result = a.mul(const, join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_variable_div_join(self, a: Variable) -> None:
+            const = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [1, 2, 3]})
+            result = a.div(const, join="inner")
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_variable_add_outer_values(self, a: Variable, b: Variable) -> None:
+            result = a.add(b, join="outer")
+            assert isinstance(result, LinearExpression)
+            assert set(result.coords["i"].values) == {0, 1, 2, 3}
+            assert result.nterm == 2
+
+        def test_variable_mul_override(self, a: Variable) -> None:
+            other = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [5, 6, 7]})
+            result = a.mul(other, join="override")
+            assert isinstance(result, LinearExpression)
+            assert list(result.coords["i"].values) == [0, 1, 2]
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, [2, 3, 4])
+
+        def test_variable_div_override(self, a: Variable) -> None:
+            other = xr.DataArray([2.0, 5.0, 10.0], dims=["i"], coords={"i": [5, 6, 7]})
+            result = a.div(other, join="override")
+            assert isinstance(result, LinearExpression)
+            assert list(result.coords["i"].values) == [0, 1, 2]
+            np.testing.assert_array_almost_equal(
+                result.coeffs.squeeze().values, [0.5, 0.2, 0.1]
+            )
+
+        def test_same_shape_add_join_override(self, a: Variable, c: Variable) -> None:
+            result = a.to_linexpr().add(c.to_linexpr(), join="override")
+            assert list(result.indexes["i"]) == [0, 1, 2]
+
+    class TestMerge:
+        def test_merge_join_parameter(self, a: Variable, b: Variable) -> None:
+            result = merge(
+                [a.to_linexpr(), b.to_linexpr()], cls=LinearExpression, join="inner"
+            )
+            assert list(result.indexes["i"]) == [1, 2]
+
+        def test_merge_outer_join(self, a: Variable, b: Variable) -> None:
+            result = merge(
+                [a.to_linexpr(), b.to_linexpr()], cls=LinearExpression, join="outer"
+            )
+            assert set(result.coords["i"].values) == {0, 1, 2, 3}
+
+        def test_merge_join_left(self, a: Variable, b: Variable) -> None:
+            result = merge(
+                [a.to_linexpr(), b.to_linexpr()], cls=LinearExpression, join="left"
+            )
+            assert list(result.indexes["i"]) == [0, 1, 2]
+
+        def test_merge_join_right(self, a: Variable, b: Variable) -> None:
+            result = merge(
+                [a.to_linexpr(), b.to_linexpr()], cls=LinearExpression, join="right"
+            )
+            assert list(result.indexes["i"]) == [1, 2, 3]
+
+    class TestValueVerification:
+        def test_add_expr_outer_const_values(self, a: Variable, b: Variable) -> None:
+            expr_a = 1 * a + 5
+            expr_b = 2 * b + 10
+            result = expr_a.add(expr_b, join="outer")
+            assert set(result.coords["i"].values) == {0, 1, 2, 3}
+            assert result.const.sel(i=0).item() == 5
+            assert result.const.sel(i=1).item() == 15
+            assert result.const.sel(i=2).item() == 15
+            assert result.const.sel(i=3).item() == 10
+
+        def test_add_expr_inner_const_values(self, a: Variable, b: Variable) -> None:
+            expr_a = 1 * a + 5
+            expr_b = 2 * b + 10
+            result = expr_a.add(expr_b, join="inner")
+            assert list(result.coords["i"].values) == [1, 2]
+            assert result.const.sel(i=1).item() == 15
+            assert result.const.sel(i=2).item() == 15
+
+        def test_add_constant_outer_fill_values(self, a: Variable) -> None:
+            expr = 1 * a + 5
+            const = xr.DataArray([10, 20], dims=["i"], coords={"i": [1, 3]})
+            result = expr.add(const, join="outer")
+            assert set(result.coords["i"].values) == {0, 1, 2, 3}
+            assert result.const.sel(i=0).item() == 5
+            assert result.const.sel(i=1).item() == 15
+            assert result.const.sel(i=2).item() == 5
+            assert result.const.sel(i=3).item() == 20
+
+        def test_add_constant_inner_fill_values(self, a: Variable) -> None:
+            expr = 1 * a + 5
+            const = xr.DataArray([10, 20], dims=["i"], coords={"i": [1, 3]})
+            result = expr.add(const, join="inner")
+            assert list(result.coords["i"].values) == [1]
+            assert result.const.sel(i=1).item() == 15
+
+        def test_add_constant_override_positional(self, a: Variable) -> None:
+            expr = 1 * a + 5
+            other = xr.DataArray([10, 20, 30], dims=["i"], coords={"i": [5, 6, 7]})
+            result = expr.add(other, join="override")
+            assert list(result.coords["i"].values) == [0, 1, 2]
+            np.testing.assert_array_equal(result.const.values, [15, 25, 35])
+
+        def test_sub_expr_outer_const_values(self, a: Variable, b: Variable) -> None:
+            expr_a = 1 * a + 5
+            expr_b = 2 * b + 10
+            result = expr_a.sub(expr_b, join="outer")
+            assert set(result.coords["i"].values) == {0, 1, 2, 3}
+            assert result.const.sel(i=0).item() == 5
+            assert result.const.sel(i=1).item() == -5
+            assert result.const.sel(i=2).item() == -5
+            assert result.const.sel(i=3).item() == -10
+
+        def test_mul_constant_override_positional(self, a: Variable) -> None:
+            expr = 1 * a + 5
+            other = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [5, 6, 7]})
+            result = expr.mul(other, join="override")
+            assert list(result.coords["i"].values) == [0, 1, 2]
+            np.testing.assert_array_equal(result.const.values, [10, 15, 20])
+            np.testing.assert_array_equal(result.coeffs.squeeze().values, [2, 3, 4])
+
+        def test_mul_constant_outer_fill_values(self, a: Variable) -> None:
+            expr = 1 * a + 5
+            other = xr.DataArray([2, 3], dims=["i"], coords={"i": [1, 3]})
+            result = expr.mul(other, join="outer")
+            assert set(result.coords["i"].values) == {0, 1, 2, 3}
+            assert result.const.sel(i=0).item() == 0
+            assert result.const.sel(i=1).item() == 10
+            assert result.const.sel(i=2).item() == 0
+            assert result.const.sel(i=3).item() == 0
+            assert result.coeffs.squeeze().sel(i=1).item() == 2
+            assert result.coeffs.squeeze().sel(i=0).item() == 0
+
+        def test_div_constant_override_positional(self, a: Variable) -> None:
+            expr = 1 * a + 10
+            other = xr.DataArray([2.0, 5.0, 10.0], dims=["i"], coords={"i": [5, 6, 7]})
+            result = expr.div(other, join="override")
+            assert list(result.coords["i"].values) == [0, 1, 2]
+            np.testing.assert_array_equal(result.const.values, [5.0, 2.0, 1.0])
+
+        def test_div_constant_outer_fill_values(self, a: Variable) -> None:
+            expr = 1 * a + 10
+            other = xr.DataArray([2.0, 5.0], dims=["i"], coords={"i": [1, 3]})
+            result = expr.div(other, join="outer")
+            assert set(result.coords["i"].values) == {0, 1, 2, 3}
+            assert result.const.sel(i=1).item() == pytest.approx(5.0)
+            assert result.coeffs.squeeze().sel(i=1).item() == pytest.approx(0.5)
+            assert result.const.sel(i=0).item() == pytest.approx(10.0)
+            assert result.coeffs.squeeze().sel(i=0).item() == pytest.approx(1.0)
+
+    class TestQuadratic:
+        def test_quadratic_add_constant_join_inner(
+            self, a: Variable, b: Variable
+        ) -> None:
+            quad = a.to_linexpr() * b.to_linexpr()
+            const = xr.DataArray([10, 20, 30], dims=["i"], coords={"i": [1, 2, 3]})
+            result = quad.add(const, join="inner")
+            assert list(result.indexes["i"]) == [1, 2, 3]
+
+        def test_quadratic_add_expr_join_inner(self, a: Variable) -> None:
+            quad = a.to_linexpr() * a.to_linexpr()
+            const = xr.DataArray([10, 20], dims=["i"], coords={"i": [0, 1]})
+            result = quad.add(const, join="inner")
+            assert list(result.indexes["i"]) == [0, 1]
+
+        def test_quadratic_mul_constant_join_inner(
+            self, a: Variable, b: Variable
+        ) -> None:
+            quad = a.to_linexpr() * b.to_linexpr()
+            const = xr.DataArray([2, 3, 4], dims=["i"], coords={"i": [1, 2, 3]})
+            result = quad.mul(const, join="inner")
+            assert list(result.indexes["i"]) == [1, 2, 3]
