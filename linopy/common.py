@@ -8,7 +8,6 @@ This module contains commonly used functions.
 from __future__ import annotations
 
 import operator
-import os
 from collections.abc import Callable, Generator, Hashable, Iterable, Sequence
 from functools import cached_property, reduce, wraps
 from pathlib import Path
@@ -159,12 +158,10 @@ def infer_schema_polars(ds: Dataset) -> dict[str, DataTypeClass]:
         dict: A dictionary mapping column names to their corresponding Polars data types.
     """
     schema: dict[str, DataTypeClass] = {}
-    np_major_version = int(np.__version__.split(".")[0])
-    use_int32 = os.name == "nt" and np_major_version < 2
     for name, array in ds.items():
         name = str(name)
         if np.issubdtype(array.dtype, np.integer):
-            schema[name] = pl.Int32 if use_int32 else pl.Int64
+            schema[name] = pl.Int32 if array.dtype.itemsize <= 4 else pl.Int64
         elif np.issubdtype(array.dtype, np.floating):
             schema[name] = pl.Float64
         elif np.issubdtype(array.dtype, np.bool_):
@@ -308,7 +305,7 @@ def save_join(*dataarrays: DataArray, integer_dtype: bool = False) -> Dataset:
         )
         arrs = xr_align(*dataarrays, join="outer")
         if integer_dtype:
-            arrs = tuple([ds.fillna(-1).astype(int) for ds in arrs])
+            arrs = tuple([astype_labels(ds) for ds in arrs])
     return Dataset({ds.name: ds for ds in arrs})
 
 
@@ -485,6 +482,30 @@ def best_int(max_value: int) -> type[signedinteger[Any]]:
         if max_value <= np.iinfo(t).max:
             return t
     raise ValueError(f"Value {max_value} is too large for int64.")
+
+
+def fitting_label_dtype(max_value: int) -> type[signedinteger[Any]]:
+    """
+    Narrowest label dtype that holds ``max_value``, but never narrower than
+    ``options["label_dtype"]``.
+
+    The configured ``label_dtype`` acts as a floor: models that fit it keep a
+    single, predictable dtype, while models exceeding it are widened (e.g. to
+    ``int64``) instead of overflowing.
+    """
+    floor = options["label_dtype"]
+    fit = best_int(max_value) if max_value >= 0 else floor
+    return max(floor, fit, key=lambda t: np.dtype(t).itemsize)
+
+
+def astype_labels(da: DataArray, fill_value: int = -1) -> DataArray:
+    """
+    Fill missing entries and cast a labels array to the narrowest int dtype that
+    holds its values without truncation (see :func:`fitting_label_dtype`).
+    """
+    filled = da.fillna(fill_value)
+    max_value = int(filled.max()) if filled.size else 0
+    return filled.astype(fitting_label_dtype(max_value))
 
 
 def get_index_map(*arrays: Sequence[Hashable]) -> dict[tuple, int]:

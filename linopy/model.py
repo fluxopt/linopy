@@ -31,6 +31,7 @@ from linopy.alignment import as_dataarray, broadcast_to_coords
 from linopy.common import (
     assign_multiindex_safe,
     best_int,
+    fitting_label_dtype,
     maybe_replace_signs,
     replace_by_map,
     to_path,
@@ -824,7 +825,9 @@ class Model:
 
         start = self._xCounter
         end = start + data.labels.size
-        data.labels.values = np.arange(start, end).reshape(data.labels.shape)
+        data.labels.values = np.arange(
+            start, end, dtype=fitting_label_dtype(end)
+        ).reshape(data.labels.shape)
         self._xCounter += data.labels.size
 
         if mask is not None:
@@ -969,7 +972,9 @@ class Model:
         """Assign label ranges from the constraint counter and apply an optional mask."""
         start = self._cCounter
         end = start + data.labels.size
-        data.labels.values = np.arange(start, end).reshape(data.labels.shape)
+        data.labels.values = np.arange(
+            start, end, dtype=fitting_label_dtype(end)
+        ).reshape(data.labels.shape)
         self._cCounter += data.labels.size
         if mask is not None:
             data.labels.values = np.where(mask.values, data.labels.values, -1)
