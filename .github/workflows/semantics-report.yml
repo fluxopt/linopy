@@ -29,11 +29,11 @@ jobs:
       run: |
         python -m pip install uv
         uv pip install --system -e ".[dev,benchmarks]"
-    - name: Build under each semantics (memray peak + time)
+    - name: Build + ops under each semantics (memray peak + time)
       run: |
-        pytest benchmarks/drivers/test_build.py \
+        pytest benchmarks/drivers/test_build.py benchmarks/drivers/test_ops.py \
           --benchmark-only --benchmark-memory --benchmark-json=legacy.json
-        LINOPY_BENCH_SEMANTICS=v1 pytest benchmarks/drivers/test_build.py \
+        LINOPY_BENCH_SEMANTICS=v1 pytest benchmarks/drivers/test_build.py benchmarks/drivers/test_ops.py \
           --benchmark-only --benchmark-memory --benchmark-json=v1.json
     - name: Render plots + table
       run: |
@@ -48,9 +48,9 @@ jobs:
           | sed 's/\x1b\[[0-9;]*m//g' > semantics-report/comparison.txt
         run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
         {
-          echo '## Build cost — v1 vs legacy (peak + time, mean)'
+          echo '## Build + op cost — v1 vs legacy (peak + time, mean)'
           echo ''
-          echo '_v1 build cost relative to legacy on this commit — not a comparison against master (that is CodSpeed)._'
+          echo '_v1 build and arithmetic-op cost relative to legacy on this commit — not a comparison against master (that is CodSpeed)._'
           echo ''
           echo '```'
           cat semantics-report/comparison.txt
