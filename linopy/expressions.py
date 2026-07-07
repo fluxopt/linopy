@@ -1102,7 +1102,7 @@ class BaseExpression(ABC):
 
         res = self.__class__(self._sum(self, dim=dim), self.model)
 
-        if drop_zeros:
+        if drop_zeros and isinstance(res, LinearExpression):
             res = res.densify_terms()
 
         return res
@@ -1497,32 +1497,66 @@ class BaseExpression(ABC):
 
     def densify_terms(self) -> Self:
         """
-        Move all non-zero term entries to the front and cut off all-zero
+        Move all active term entries to the front and cut off dead
         entries in the term-axis.
+
+        A term is considered active if its variable label is not -1
+        (masked/missing) and its coefficient is not 0.
         """
         data = self.data.transpose(..., TERM_DIM)
 
+        vdata = data.vars.data
         cdata = data.coeffs.data
         axis = cdata.ndim - 1
-        nnz = np.nonzero(cdata)
-        nterm = (cdata != 0).sum(axis).max()
 
+        # A term is alive if it has a valid variable AND nonzero coefficient
+        alive = (vdata != -1) & (cdata != 0)
+        nterm_per_cell = alive.sum(axis)
+        if nterm_per_cell.size == 0 or nterm_per_cell.max() == 0:
+            return self.__class__(data.sel({TERM_DIM: slice(0, 1)}), self.model)
+        nterm = int(nterm_per_cell.max())
+
+        # Nothing to compact if all term slots are already used
+        if nterm == cdata.shape[axis]:
+            return self
+
+        nnz = np.nonzero(alive)
         mod_nnz = list(nnz)
         mod_nnz.pop(axis)
 
+        if not mod_nnz:
+            # Scalar case (only _term dimension)
+            new_index = np.arange(len(nnz[0]))
+            mod_nnz.insert(axis, new_index)
+            new_vdata = np.full_like(vdata, -1)
+            new_vdata[tuple(mod_nnz)] = vdata[nnz]
+            data.vars.data = new_vdata
+            new_cdata = np.zeros_like(cdata)
+            new_cdata[tuple(mod_nnz)] = cdata[nnz]
+            data.coeffs.data = new_cdata
+            return self.__class__(data.sel({TERM_DIM: slice(0, nterm)}), self.model)
+
         remaining_axes = np.vstack(mod_nnz).T
         _, idx_ = np.unique(remaining_axes, axis=0, return_inverse=True)
-        idx = list(idx_)
-        new_index = np.array([idx[:i].count(j) for i, j in enumerate(idx)])
+        # Vectorized cumulative count within groups (O(n log n) vs O(n²))
+        order = np.argsort(idx_, kind="mergesort")
+        sorted_idx = idx_[order]
+        group_pos = np.ones(len(sorted_idx), dtype=np.intp)
+        group_pos[0] = 0
+        group_pos[1:] = (sorted_idx[1:] != sorted_idx[:-1]).astype(np.intp)
+        np.cumsum(group_pos, out=group_pos)
+        group_pos -= group_pos[np.searchsorted(sorted_idx, sorted_idx, side="left")]
+        new_index = np.empty_like(group_pos)
+        new_index[order] = group_pos
         mod_nnz.insert(axis, new_index)
 
-        vdata = np.full_like(cdata, -1)
-        vdata[tuple(mod_nnz)] = data.vars.data[nnz]
-        data.vars.data = vdata
+        new_vdata = np.full_like(vdata, -1)
+        new_vdata[tuple(mod_nnz)] = vdata[nnz]
+        data.vars.data = new_vdata
 
-        cdata = np.zeros_like(cdata)
-        cdata[tuple(mod_nnz)] = data.coeffs.data[nnz]
-        data.coeffs.data = cdata
+        new_cdata = np.zeros_like(cdata)
+        new_cdata[tuple(mod_nnz)] = cdata[nnz]
+        data.coeffs.data = new_cdata
 
         return self.__class__(data.sel({TERM_DIM: slice(0, nterm)}), self.model)
 
